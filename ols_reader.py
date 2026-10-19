@@ -21,6 +21,13 @@ Supported OLS Versions:
     - v597+ KP: Map pack format with ZIP-compressed parameters
     - v804+:    WinOLS 5 format (15 metadata strings, derived version records)
 
+The reader is pure Python with no dependencies.  Input files are treated as
+untrusted: every read is bounds-checked, decompression is capped by
+``max_decompressed_size`` and malformed data never raises anything other
+than :class:`OLSError` (non-WinOLS input) or :class:`OLSLimitError`
+(resource limit exceeded).  Recoverable problems are reported in
+:attr:`OLSFile.warnings`.
+
 Usage:
     from ols_reader import read_ols, OLSReader
 
@@ -38,19 +45,137 @@ Usage:
     ols = reader.parse()
     for version in ols.binary_versions:
         data = reader.extract_binary(version)
-        with open(f"{version.name}.bin", "wb") as f:
-            f.write(data)
+
+    # Parse from memory (e.g. an upload)
+    ols = OLSReader.from_bytes(payload, filename="upload.ols").parse()
 """
 
 from __future__ import annotations
 
+import codecs
+import encodings.cp1252
 import io
+import logging
+import math
+import os
 import re
 import struct
+import sys
 import zipfile
-from dataclasses import dataclass, field
+import zlib
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
+
+__version__ = "1.2.0"
+
+__all__ = [
+    "AxisInfo",
+    "BinaryVersion",
+    "CALBlock",
+    "DEFAULT_MAX_DECOMPRESSED_SIZE",
+    "FolderEntry",
+    "OLSError",
+    "OLSFile",
+    "OLSFormatError",
+    "OLSLimitError",
+    "OLSReader",
+    "Parameter",
+    "main",
+    "read_ols",
+]
+
+logger = logging.getLogger(__name__)
+
+#: Upper bound for data inflated from a compressed map list or a KP archive.
+#: Guards against decompression bombs; raise it via ``max_decompressed_size``
+#: if a legitimate file needs more.
+DEFAULT_MAX_DECOMPRESSED_SIZE = 256 * 1024 * 1024
+
+
+class OLSError(ValueError):
+    """Base class for all errors raised while reading WinOLS files."""
+
+
+class OLSFormatError(OLSError):
+    """The input is not a WinOLS .ols/.kp file."""
+
+
+class OLSLimitError(OLSError):
+    """The input exceeds a resource limit (e.g. a decompression bomb)."""
+
+
+# ---------------------------------------------------------------------------
+# Binary layout helpers (pre-compiled once at import time)
+# ---------------------------------------------------------------------------
+
+_U16 = struct.Struct('<H').unpack_from
+_U32 = struct.Struct('<I').unpack_from
+_U32X2 = struct.Struct('<2I').unpack_from
+_U32X3 = struct.Struct('<3I').unpack_from
+_U32X6 = struct.Struct('<6I').unpack_from
+_UNIT_DESC = struct.Struct('<ddI').unpack_from  # factor, offset, data_offset
+_AXIS_DESC = struct.Struct('<ddIII').unpack_from  # factor, offset, type, address, kind
+
+_OLS_MAGIC = 0x0B  # length of the "WinOLS File" signature string
+_OLS_SIGNATURE = "WinOLS File"
+_BLOB_MARKER = struct.pack('<I', 0x42007899)
+_MAP_LIST_MARKER = struct.pack('<I', 0x11883377)
+_DERIVED_MARKER = b'\xff\xff\xff\xff'
+_FOLDER_MARKER = b'\xff\xff\xff\xff\x00\x00\x00\x00'  # marker + zero padding
+_ZIP_SIGNATURE = b'PK\x03\x04'
+_KP_ENTRY = 'intern'
+
+_CAS_RE = re.compile(rb'CAS[A-Z][A-Z0-9]{4}')
+_EPK_RE = re.compile(rb'S[A-Z][0-9A-Z]{5}\x00')
+_EPK_TEXT_RE = re.compile(r'(S[A-Z][0-9A-Z]{5})')
+
+# CAL block: at most 2 MiB, terminated by more than 32 KiB of 0xFF fill
+_CAL_MAX_SIZE = 0x200000
+_CAL_MIN_SIZE = 0x10000
+_CAL_FILL_RUN = b'\xff' * 0x8001
+_CAL_ALIGN = 0x1000
+
+# Value-type code (1/3/5/7) -> data type name.  OLS does not store signedness.
+_TYPE_KINDS = {1: "UBYTE", 3: "UWORD", 5: "ULONG", 7: "FLOAT32"}
+_PARAM_TYPES = {1: "VALUE", 2: "VALUE", 3: "CURVE", 4: "MAP", 5: "MAP"}
+
+# EPK prefix -> CAL offset inside a full flash image
+_CAL_OFFSETS_BY_EPK = (
+    (('SCG',), 0x820000),  # Simos18.10 (Aurix TC29x)
+    (('SC8',), 0x800000),  # Simos18.1 (TC1793)
+    (('SC1', 'SA3'), 0x40000),  # Simos12 (TC1797)
+    (('SC4',), 0x100000),  # Simos16
+    (('S82', 'S85'), 0x40000),  # MED17
+)
+
+# Candidate KP record header: type code 2..20, four u32 values < 1024, any
+# u32, then a name length of 4..59.  The exact checks happen in Python; the
+# regex only lets the C regex engine skip the bytes that cannot match.
+_KP_HEADER_RE = re.compile(
+    rb'[\x02-\x14]\x00\x00\x00'
+    rb'(?:[\x00-\xff][\x00-\x03]\x00\x00){4}'
+    rb'[\x00-\xff]{4}'
+    rb'[\x04-\x3b]\x00\x00\x00'
+)
+
+_UNSET: Any = object()
+
+_CP1252_TABLE = encodings.cp1252.decoding_table
+
+
+def _decode_cp1252(raw: bytes) -> str:
+    """
+    Decode Windows-1252 text (the encoding of all OLS strings).
+
+    Same result as ``raw.decode('cp1252', errors='replace')`` but several
+    times faster: ASCII takes the C fast path and everything else skips the
+    codec registry lookup.
+    """
+    if raw.isascii():
+        return raw.decode('ascii')
+    # typeshed omits str decoding tables, which encodings.cp1252 itself uses
+    return codecs.charmap_decode(raw, 'replace', _CP1252_TABLE)[0]  # type: ignore[arg-type]
 
 
 @dataclass
@@ -66,7 +191,7 @@ class AxisInfo:
     """Axis definition for CURVE/MAP parameters"""
     points: int
     address: int = 0  # CAL offset/address for axis data
-    offset: int = 0  # Conversion offset (physical = raw * factor + offset)
+    offset: float = 0.0  # Conversion offset (physical = raw * factor + offset)
     unit: str = ""
     factor: float = 1.0  # Conversion factor (physical = raw * factor + offset)
     id: str = ""  # Axis ID (e.g., "n_32", "_CNV_A_R_LINEAR_____33_CM")
@@ -90,7 +215,7 @@ class Parameter:
     unit: str = ""
     factor: float = 1.0  # Conversion factor (physical = raw * factor + offset)
     offset: float = 0.0  # Conversion offset
-    folder_id: int = 0  # Folder/category ID (numeric ID only - folder names not found in OLS files)
+    folder_id: int = 0  # Folder/category ID (see OLSFile.folders)
     type_code: int = 0  # Raw type code from metadata (2=VALUE, 3=CURVE, 4=MAP, 5=MAP_INVERSE)
 
 
@@ -159,6 +284,355 @@ class OLSFile:
     is_kp_file: bool = False  # True if this is a KP (Kennfeld Pack) file
     big_endian_data: bool = False  # True if binary data should be read as big-endian (common for KP/DSG)
     folders: list[FolderEntry] = field(default_factory=list)  # Folder/Function entries
+    warnings: list[str] = field(default_factory=list)  # Recoverable problems found while parsing
+
+    def to_dict(self, *, include_cal_data: bool = False) -> dict[str, Any]:
+        """
+        Return the parsed contents as plain dicts/lists (e.g. for ``json.dumps``).
+
+        The CAL block's raw bytes are replaced by their ``size``; pass
+        ``include_cal_data=True`` to also get them as a hex string.
+        """
+        result = asdict(self)
+        cal = result["cal_block"]
+        if cal is not None:
+            raw = cal.pop("data")
+            cal["size"] = len(raw)
+            if include_cal_data:
+                cal["data"] = raw.hex()
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Map record reader
+# ---------------------------------------------------------------------------
+
+class _MapRecordReader:
+    """
+    Sequential reader for WinOLS map records (COlsMap::ReadFromFile).
+
+    A record is a sequence of fields; every field introduced with format
+    version N is only present when ``N <= file version`` ("feature N").  The
+    field order is documented in ``__init__`` where the per-version layout is
+    computed once: runs of fixed-size fields that the reader does not need
+    collapse into a single bounds-checked jump, so a record costs about a
+    dozen operations instead of ~100 individual reads.
+
+    Error semantics are those of a field-by-field reader: ``EOFError`` when a
+    field extends past the buffer, ``ValueError`` for an implausible length
+    or element count.  Counts that cannot possibly fit into the remaining
+    data are rejected up front instead of being iterated.
+    """
+
+    __slots__ = (
+        'buf', 'end', 'str_pad', 'mls', 'lang', 'min_lang_str', 'min_mls',
+        'head', 'alt_desc', 'pre_desc', 'named', 'mid', 'unit_fixed',
+        'axis_fixed', 'axis_source', 'axis_array', 'axis_mid', 'axis_string',
+        'axis_texts', 'axis_tail', 'tail', 'tail_arrays', 'tail2',
+    )
+
+    def __init__(self, buf: bytes, version: int) -> None:
+        def has(feature: int) -> bool:
+            return feature <= version
+
+        self.buf = buf
+        self.end = len(buf)
+
+        # string:   u32 length + bytes (+ NUL terminator before v439)
+        # mls:      string [u32 lang_id, u32 flags (v345+)] u32 count
+        #           + count * (string [u32 lang_id (v345+)])       (v330+)
+        self.str_pad = 0 if has(439) else 1
+        self.mls = has(330)
+        self.lang = 4 if has(345) else 0
+        self.min_lang_str = 4 + self.lang
+        self.min_mls = 4 + 2 * self.lang + 4 if self.mls else 4
+
+        # --- record head ----------------------------------------------------
+        #   [268: u8] [282: u32] [287: mls alt_description] [93: u8]
+        #   mls description
+        #   u32 type_code, u32, u32 type_kind (1/3/5/7), u32 byte width,
+        #   u32 legacy (always 0x0a)
+        #   [80: u32 folder_id, string name]
+        self.head = (1 if has(268) else 0) + (4 if has(282) else 0)
+        self.alt_desc = has(287)
+        self.pre_desc = 1 if has(93) else 0
+        self.named = has(80)
+
+        #   [298: u32] [299: u32] [94: u32] [74: bool] [123: u32 (file mode 1)]
+        #   [300: 6 x f64] then [67: 6 x f64 | 66: 2 x f64 | <59: 2 x u32]
+        #   4 x bool, then u32 dim1, u32 dim2, 3 x u32
+        mid = ((4 if has(298) else 0) + (4 if has(299) else 0)
+               + (4 if has(94) else 0) + (1 if has(74) else 0)
+               + (4 if has(123) else 0) + (48 if has(300) else 0))
+        if has(67):
+            mid += 48
+        elif has(66):
+            mid += 16
+        elif not has(59):
+            mid += 8
+        self.mid = mid + 4
+
+        # --- axis unit descriptor --------------------------------------------
+        #   string unit, string alt_unit, f64 factor, f64 offset,
+        #   u32 data_offset, u32 end_offset, u32 field_4c,
+        #   [264: f64] [61: u32] [105: 3 x u32, i32]
+        self.unit_fixed = (28 + (8 if has(264) else 0) + (4 if has(61) else 0)
+                           + (16 if has(105) else 0))
+
+        # --- axis data block (COlsAxisData_ReadFromFile, Ghidra: 0x003d1684) --
+        #   mls description, string axis_id, f64 factor, f64 offset,
+        #   u32 type_code (axis+0x64), u32 address (axis+0x70),
+        #   u32 type_kind 1/3/5/7 (axis+0x74), u32 byte width (axis+0x78),
+        #   u32 data_format (axis+0x7c, always 0xa), bool, bool,
+        #   [264: f64] [241: u32] [8: u32 data_source] [805: u32] [12: bool]
+        #   [73: u32 count + bytes] [77: u32] [91: i32] [354: string]
+        #   [372: u32 count + count * mls] [440: i32] [805: 4 x u32]
+        # The breakpoint COUNT is not stored here; it comes from the record's
+        # dimensions (cols for X, rows for Y).
+        fixed = 36 + 2 + (8 if has(264) else 0) + (4 if has(241) else 0)
+        self.axis_source = fixed if has(8) else -1
+        self.axis_fixed = (fixed + (4 if has(8) else 0) + (4 if has(805) else 0)
+                           + (1 if has(12) else 0))
+        self.axis_array = has(73)
+        self.axis_mid = (4 if has(77) else 0) + (4 if has(91) else 0)
+        self.axis_string = has(354)
+        self.axis_texts = has(372)
+        self.axis_tail = (4 if has(440) else 0) + (16 if has(805) else 0)
+
+        # --- record tail -------------------------------------------------------
+        #   [58: bool] [68: bool] [90: u32] [9: 2 x u32]
+        #   [49: u32, bool, bool, f64, f64] [51: u32] [53: bool, 3 x f64, u32]
+        #   [54: f64] [55: 3 x bool] [315: u32] [383: i32 + 16 bytes]
+        #   [329: u32] [346: 2 x u32] [395: u32]
+        #   [476: u32, u32 count + count * u32, u32 count + count * string]
+        #   [503: u32, f64] [596: u32] [822: u32]
+        self.tail = sum(size for feature, size in (
+            (58, 1), (68, 1), (90, 4), (9, 8), (49, 22), (51, 4), (53, 29),
+            (54, 8), (55, 3), (315, 4), (383, 20), (329, 4), (346, 8), (395, 4),
+        ) if has(feature))
+        self.tail_arrays = has(476)
+        self.tail2 = (12 if has(503) else 0) + (4 if has(596) else 0) + (4 if has(822) else 0)
+
+    # -- primitives ------------------------------------------------------------
+
+    def skip(self, pos: int, size: int) -> int:
+        """Skip ``size`` bytes of fixed-size fields (no-op for size 0)."""
+        if size and pos + size > self.end:
+            raise EOFError(f"{size} bytes at 0x{pos:x}")
+        return pos + size
+
+    # read_str/skip_str are the hottest functions; keep them flat.
+
+    def read_str(self, pos: int) -> tuple[str, int]:
+        if pos + 4 > self.end:
+            raise EOFError(f"string length at 0x{pos:x}")
+        length = _U32(self.buf, pos)[0]
+        pos += 4
+        if length == 0 or length >= 0xFFFFFFF0:
+            return "", pos
+        if length > 0x100000:
+            raise ValueError(f"string at 0x{pos:x}: length {length}")
+        end = pos + length
+        if end > self.end:
+            raise EOFError(f"string at 0x{pos:x}: need {length}")
+        return _decode_cp1252(self.buf[pos:end]).rstrip('\x00'), end + self.str_pad
+
+    def skip_str(self, pos: int) -> int:
+        if pos + 4 > self.end:
+            raise EOFError(f"string length at 0x{pos:x}")
+        length = _U32(self.buf, pos)[0]
+        pos += 4
+        if length == 0 or length >= 0xFFFFFFF0:
+            return pos
+        if length > 0x100000:
+            raise ValueError(f"string at 0x{pos:x}: length {length}")
+        pos += length
+        if pos > self.end:
+            raise EOFError(f"string at 0x{pos - length:x}: need {length}")
+        return pos + self.str_pad
+
+    def _skip_mls_rest(self, pos: int) -> int:
+        # lang_id + flags (v345+) and the translation count
+        size = 2 * self.lang + 4
+        if pos + size > self.end:
+            raise EOFError(f"multi-language string at 0x{pos:x}")
+        count = _U32(self.buf, pos + size - 4)[0]
+        pos += size
+        if count:
+            if pos + count * self.min_lang_str > self.end + 1:
+                raise EOFError(f"{count} translations at 0x{pos:x}")
+            lang = self.lang
+            for _ in range(count):
+                pos = self.skip(self.skip_str(pos), lang)
+        return pos
+
+    def read_mls(self, pos: int) -> tuple[str, int]:
+        text, pos = self.read_str(pos)
+        return text, (self._skip_mls_rest(pos) if self.mls else pos)
+
+    def skip_mls(self, pos: int) -> int:
+        pos = self.skip_str(pos)
+        return self._skip_mls_rest(pos) if self.mls else pos
+
+    def _skip_byte_array(self, pos: int) -> int:
+        if pos + 4 > self.end:
+            raise EOFError(f"array length at 0x{pos:x}")
+        count: int = _U32(self.buf, pos)[0]
+        pos += 4
+        if count == 0 or count >= 0xFFFFFFF0:
+            return pos
+        if count > 0x1000000:
+            raise ValueError(f"array at 0x{pos:x}: count {count}")
+        if pos + count > self.end:
+            raise EOFError(f"array at 0x{pos:x}: need {count}")
+        return pos + count
+
+    # -- axis blocks -------------------------------------------------------------
+
+    def _skip_axis_rest(self, pos: int) -> int:
+        if self.axis_array:
+            pos = self._skip_byte_array(pos)
+        pos = self.skip(pos, self.axis_mid)
+        if self.axis_string:
+            pos = self.skip_str(pos)
+        if self.axis_texts:
+            if pos + 4 > self.end:
+                raise EOFError(f"axis text count at 0x{pos:x}")
+            count = _U32(self.buf, pos)[0]
+            pos += 4
+            if count:
+                if pos + count * self.min_mls > self.end + 1:
+                    raise EOFError(f"{count} axis texts at 0x{pos:x}")
+                for _ in range(count):
+                    pos = self.skip_mls(pos)
+        return self.skip(pos, self.axis_tail)
+
+    def read_axis(self, pos: int) -> tuple[AxisInfo, int]:
+        description, pos = self.read_mls(pos)
+        axis_id, pos = self.read_str(pos)
+        if pos + self.axis_fixed > self.end:
+            raise EOFError(f"axis data at 0x{pos:x}")
+        factor, offset, _, address, type_kind = _AXIS_DESC(self.buf, pos)
+        source = self.axis_source
+        data_source = _U32(self.buf, pos + source)[0] if source >= 0 else 0
+        pos = self._skip_axis_rest(pos + self.axis_fixed)
+        return AxisInfo(
+            points=0,
+            address=address,
+            offset=offset,
+            factor=factor,
+            id=axis_id,
+            description=description,
+            data_source=data_source,
+            data_type=_TYPE_KINDS.get(type_kind, "UWORD"),
+        ), pos
+
+    def skip_axis(self, pos: int) -> int:
+        pos = self.skip_str(self.skip_mls(pos))
+        return self._skip_axis_rest(self.skip(pos, self.axis_fixed))
+
+    # -- record ------------------------------------------------------------------
+
+    def read_map(self, pos: int) -> tuple[Parameter, int]:
+        """Read the map record at ``pos``; return it and the next position."""
+        buf = self.buf
+        end = self.end
+
+        pos = self.skip(pos, self.head)
+        if self.alt_desc:
+            pos = self.skip_mls(pos)
+        pos = self.skip(pos, self.pre_desc)
+        description, pos = self.read_mls(pos)
+
+        if pos + 20 > end:
+            raise EOFError(f"map type at 0x{pos:x}")
+        type_code, _, type_kind = _U32X3(buf, pos)
+        pos += 20
+
+        name = ""
+        folder_id = 0
+        if self.named:
+            if pos + 4 > end:
+                raise EOFError(f"folder id at 0x{pos:x}")
+            folder_id = _U32(buf, pos)[0]
+            if folder_id > 1000:
+                folder_id = 0
+            name, pos = self.read_str(pos + 4)
+
+        if pos + self.mid + 20 > end:
+            raise EOFError(f"map dimensions at 0x{pos:x}")
+        dim1, dim2 = _U32X2(buf, pos + self.mid)
+        pos += self.mid + 20
+
+        unit, pos = self.read_str(pos)
+        pos = self.skip_str(pos)  # alt unit
+        if pos + self.unit_fixed > end:
+            raise EOFError(f"unit descriptor at 0x{pos:x}")
+        factor, conv_offset, data_offset = _UNIT_DESC(buf, pos)
+        pos += self.unit_fixed
+
+        param_type = _PARAM_TYPES.get(type_code, "MAP" if type_code > 5 else "VALUE")
+
+        # Two axis blocks follow: the first is Y for maps / X for curves.
+        x_axis: Optional[AxisInfo] = None
+        y_axis: Optional[AxisInfo] = None
+        if param_type == "MAP":
+            y_axis, pos = self.read_axis(pos)
+            x_axis, pos = self.read_axis(pos)
+        elif param_type == "CURVE":
+            x_axis, pos = self.read_axis(pos)
+            pos = self.skip_axis(pos)
+        else:
+            pos = self.skip_axis(self.skip_axis(pos))
+
+        pos = self.skip(pos, self.tail)
+        if self.tail_arrays:
+            if pos + 8 > end:
+                raise EOFError(f"u32 array at 0x{pos:x}")
+            count = _U32(buf, pos + 4)[0]
+            pos += 8
+            if count:
+                if count > 0x100000:
+                    raise ValueError(f"u32 array at 0x{pos:x}: count {count}")
+                pos = self.skip(pos, 4 * count)
+            if pos + 4 > end:
+                raise EOFError(f"string array at 0x{pos:x}")
+            count = _U32(buf, pos)[0]
+            pos += 4
+            if count:
+                if pos + 4 * count > end + 1:
+                    raise EOFError(f"{count} strings at 0x{pos:x}")
+                for _ in range(count):
+                    pos = self.skip_str(pos)
+        pos = self.skip(pos, self.tail2)
+
+        cols = max(1, min(dim1, 0x4000))
+        rows = 1
+        if type_code > 3:
+            rows = max(1, dim2)
+            if rows > 0x4000:
+                rows = 1
+        if x_axis is not None:
+            x_axis.points = cols
+        if y_axis is not None:
+            y_axis.points = rows
+
+        return Parameter(
+            name=name,
+            description=description,
+            param_type=param_type,
+            data_type=_TYPE_KINDS.get(type_kind, "UWORD"),
+            cols=cols,
+            rows=rows,
+            data_offset=data_offset,
+            x_axis=x_axis,
+            y_axis=y_axis,
+            unit=unit,
+            factor=factor,
+            offset=conv_offset,
+            folder_id=folder_id,
+            type_code=type_code,
+        ), pos
 
 
 class OLSReader:
@@ -186,31 +660,71 @@ class OLSReader:
         filepath: Path to the OLS file
         data: Raw file bytes
         version: OLS format version (set during parsing)
+        max_decompressed_size: Limit for decompressed map lists / KP archives
     """
 
     # Format version thresholds (for binary version / folder detection only)
     NEW_FORMAT_VERSION = 300
     NEWER_FORMAT_VERSION = 400
 
-    def __init__(self, filepath: str | Path):
+    def __init__(
+        self,
+        filepath: str | os.PathLike[str],
+        *,
+        max_decompressed_size: int = DEFAULT_MAX_DECOMPRESSED_SIZE,
+    ) -> None:
         self.filepath = Path(filepath)
         self.data = self.filepath.read_bytes()
+        self._setup(max_decompressed_size)
+
+    @classmethod
+    def from_bytes(
+        cls,
+        data: bytes | bytearray | memoryview,
+        filename: str = "<memory>",
+        *,
+        max_decompressed_size: int = DEFAULT_MAX_DECOMPRESSED_SIZE,
+    ) -> OLSReader:
+        """Create a reader for an in-memory file (``filename`` is informational)."""
+        reader = cls.__new__(cls)
+        reader.filepath = Path(filename)
+        reader.data = bytes(data)
+        reader._setup(max_decompressed_size)
+        return reader
+
+    def _setup(self, max_decompressed_size: int) -> None:
+        if max_decompressed_size <= 0:
+            raise ValueError("max_decompressed_size must be positive")
+        self.max_decompressed_size = max_decompressed_size
         self.pos = 0
         self.version = 0  # Will be set during header parsing
+        self._warnings: list[str] = []
+        self._cas_epk: Optional[tuple[int, str]] = _UNSET
 
     def parse(self) -> OLSFile:
-        """Parse the OLS file and return structured data"""
+        """
+        Parse the OLS file and return structured data.
+
+        Raises:
+            OLSFormatError: the data is not a WinOLS file.
+            OLSLimitError: compressed content exceeds ``max_decompressed_size``.
+        """
         ols = OLSFile(filename=self.filepath.name)
+        self._warnings = ols.warnings
 
         # Parse header for vehicle metadata
         self._parse_header(ols)
         ols.version = self.version
 
-        # Check if this is a KP (Kennfeld Pack) file with ZIP-compressed parameters
-        if self._is_kp_file():
+        # KP (Kennfeld Pack) files keep their parameters in a ZIP archive
+        archive = self._open_kp_archive()
+        if archive is not None:
             ols.is_kp_file = True
             ols.big_endian_data = True  # KP files typically have big-endian data
-            ols.parameters = self._extract_kp_parameters()
+            with archive:
+                intern = self._read_kp_intern(archive)
+            if intern is not None:
+                ols.parameters = self._extract_kp_parameters(intern)
             # KP files don't have embedded binary versions or CAL blocks
             return ols
 
@@ -227,103 +741,113 @@ class OLSReader:
 
         return ols
 
-    def _is_kp_file(self) -> bool:
+    def _warn(self, message: str) -> None:
+        logger.debug("%s: %s", self.filepath.name, message)
+        self._warnings.append(message)
+
+    # -------------------------------------------------------------------
+    # KP (Kennfeld Pack) files
+    # -------------------------------------------------------------------
+
+    def _open_kp_archive(self) -> Optional[zipfile.ZipFile]:
         """
-        Check if this is a KP (Kennfeld Pack) file.
+        Open the ZIP archive of a KP (Kennfeld Pack) file.
 
         KP files are v597+ OLS files that contain ZIP-compressed parameter data
         instead of raw parameter records. They're identified by:
         - Version >= 597
         - ZIP signature (PK\\x03\\x04) present after header
         - Contains "intern" file in the ZIP archive
+
+        Returns None for anything that is not a KP file.
         """
         if self.version < 597:
-            return False
+            return None
 
         # Look for ZIP signature after header (typically around 0x400-0x500)
-        zip_sig = b'PK\x03\x04'
-        zip_pos = self.data.find(zip_sig, 0x100, 0x1000)
-
+        zip_pos = self.data.find(_ZIP_SIGNATURE, 0x100, 0x1000)
         if zip_pos < 0:
-            return False
+            return None
 
-        # Verify it's a valid ZIP with "intern" file
         try:
-            zip_data = self.data[zip_pos:]
-            with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
-                return 'intern' in zf.namelist()
-        except (zipfile.BadZipFile, Exception):
-            return False
+            archive = zipfile.ZipFile(io.BytesIO(self.data[zip_pos:]))
+        except Exception:  # any failure simply means "not a KP archive"
+            return None
+        if _KP_ENTRY not in archive.namelist():
+            archive.close()
+            return None
+        return archive
 
-    def _extract_kp_parameters(self) -> list[Parameter]:
+    def _read_kp_intern(self, archive: zipfile.ZipFile) -> Optional[bytes]:
+        """Read the "intern" entry, refusing to inflate more than the limit."""
+        info = archive.getinfo(_KP_ENTRY)
+        if info.file_size > self.max_decompressed_size:
+            raise OLSLimitError(
+                f"{self.filepath.name}: KP entry '{_KP_ENTRY}' would inflate to "
+                f"{info.file_size} bytes (limit {self.max_decompressed_size})"
+            )
+        try:
+            # ZipExtFile never returns more than info.file_size bytes
+            return archive.read(info)
+        except Exception as exc:
+            self._warn(f"cannot read KP entry '{_KP_ENTRY}': {exc}")
+            return None
+
+    def _extract_kp_parameters(self, intern_data: bytes) -> list[Parameter]:
         """
-        Extract parameters from KP (Kennfeld Pack) file.
+        Extract parameters from the "intern" file of a KP (Kennfeld Pack) file.
 
         KP files store parameters in a ZIP-compressed "intern" file with structure:
         - Metadata (6 x u32): type_code, and dimension info
         - Name length (u32) + name string
         - Post-name data (~0x9c-0xb0 bytes) containing address
 
+        Records are located by scanning 4-byte steps for a plausible header;
+        after a record is found the scan continues 0x100 bytes past its name.
         Addresses in KP files are direct file offsets into the corresponding .bin file.
         """
-        parameters = []
+        parameters: list[Parameter] = []
         found_names: set[str] = set()
 
-        # Find and extract intern file
-        zip_sig = b'PK\x03\x04'
-        zip_pos = self.data.find(zip_sig, 0x100, 0x1000)
-
-        if zip_pos < 0:
-            return parameters
-
-        try:
-            zip_data = self.data[zip_pos:]
-            with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
-                intern_data = zf.read('intern')
-        except (zipfile.BadZipFile, KeyError, Exception):
-            return parameters
-
-        # Parse parameters from intern file
+        data = intern_data
+        limit = len(data) - 300
+        search = _KP_HEADER_RE.search
         pos = 0
-        while pos < len(intern_data) - 300:
-            try:
-                # Read potential metadata (6 x u32)
-                meta = struct.unpack_from('<6I', intern_data, pos)
-                type_code = meta[0]
+        while pos < limit:
+            # Let the regex engine jump to the next plausible header, then
+            # realign with the 4-byte scan grid.
+            match = search(data, pos)
+            if match is None:
+                break
+            candidate = match.start()
+            if candidate >= limit:
+                break
+            skew = (candidate - pos) % 4
+            if skew:
+                pos = candidate + 4 - skew
+                continue
+            pos = candidate
 
-                # Validate metadata pattern
-                if type_code in (2, 3) or 4 <= type_code <= 20:
-                    if all(m < 1000 for m in meta[1:5]):
-                        # Check for name length at pos + 24
-                        name_len = struct.unpack_from('<I', intern_data, pos + 24)[0]
-
-                        if 3 < name_len < 60 and pos + 28 + name_len < len(intern_data):
-                            try:
-                                name = intern_data[pos + 28:pos + 28 + name_len].decode('ascii').rstrip('\x00')
-
-                                # Validate name
-                                clean_name = name.replace('_', '').replace('[', '').replace(']', '').replace('.', '')
-                                if (name.isprintable() and
-                                    clean_name.isalnum() and
-                                    len(name) >= 3 and
-                                    ('_' in name or '.' in name) and
-                                    name not in found_names):
-
-                                    found_names.add(name)
-                                    param = self._parse_kp_parameter_record(
-                                        intern_data, pos, name_len, name, meta
-                                    )
-                                    if param:
-                                        parameters.append(param)
-
-                                    # Skip to next record
-                                    pos = pos + 28 + name_len + 0x100
-                                    continue
-                            except (UnicodeDecodeError, ValueError):
-                                pass
-            except struct.error:
-                pass
-
+            meta = _U32X6(data, pos)
+            if max(meta[1:5]) < 1000:
+                name_len = _U32(data, pos + 24)[0]
+                try:
+                    name = data[pos + 28:pos + 28 + name_len].decode('ascii').rstrip('\x00')
+                except UnicodeDecodeError:
+                    name = ""
+                clean_name = name.replace('_', '').replace('[', '').replace(']', '').replace('.', '')
+                if (name.isprintable() and
+                        clean_name.isalnum() and
+                        len(name) >= 3 and
+                        ('_' in name or '.' in name) and
+                        name not in found_names):
+                    found_names.add(name)
+                    param = self._parse_kp_parameter_record(data, pos, name_len, name, meta)
+                    if param:
+                        parameters.append(param)
+                    # Skip to next record
+                    pos = pos + 28 + name_len + 0x100
+                    continue
             pos += 4
 
         return parameters
@@ -346,8 +870,9 @@ class OLSReader:
         - Address is at variable offset 0x9c-0xb0 from name end
         """
         name_end = meta_pos + 28 + name_len
+        size = len(intern_data)
 
-        if name_end + 0xb0 > len(intern_data):
+        if name_end + 0xb0 > size:
             return None
 
         # Determine type from metadata
@@ -370,50 +895,43 @@ class OLSReader:
 
         # Find address - scan range 0x9c-0xb0 from name_end
         # KP addresses are direct file offsets stored as little-endian
-        # Typically in 0x60000-0x80000 range for DSG
+        # Typically in 0x60000-0x80000 range for DSG, but allow wider range for other ECUs
         data_offset = 0
         for off in range(0x9c, 0xb0):
             addr_pos = name_end + off
-            if addr_pos + 4 <= len(intern_data):
-                candidate = struct.unpack_from('<I', intern_data, addr_pos)[0]
-                # Valid address range depends on ECU type
-                # DSG: 0x60000-0x80000, but allow wider range for other ECUs
+            if addr_pos + 4 <= size:
+                candidate = _U32(intern_data, addr_pos)[0]
                 if 0x1000 <= candidate < 0x800000:
                     data_offset = candidate
                     break
 
-        # Try to find axis offset (typically 4 bytes after data offset)
+        # Axis address typically follows the data address
         x_axis = None
         y_axis = None
         if data_offset > 0 and param_type in ("CURVE", "MAP"):
             for off in range(0x9c, 0xb0):
                 addr_pos = name_end + off
-                if addr_pos + 8 <= len(intern_data):
-                    addr1 = struct.unpack_from('<I', intern_data, addr_pos)[0]
-                    addr2 = struct.unpack_from('<I', intern_data, addr_pos + 4)[0]
+                if addr_pos + 8 <= size:
+                    addr1, addr2 = _U32X2(intern_data, addr_pos)
                     if addr1 == data_offset and 0x1000 <= addr2 < 0x800000:
-                        x_axis = AxisInfo(points=cols, offset=addr2)
+                        x_axis = AxisInfo(points=cols, address=addr2)
                         if param_type == "MAP" and rows > 1:
-                            # Y-axis offset typically follows X-axis data
-                            y_axis = AxisInfo(points=rows, offset=addr2 + cols * 2)
+                            # Y-axis data typically follows X-axis data
+                            y_axis = AxisInfo(points=rows, address=addr2 + cols * 2)
                         break
 
-        # Try to extract description (search backwards from metadata)
+        # Try to extract description (length-prefixed string before metadata)
         description = ""
         if meta_pos > 50:
-            # Look for length-prefixed string before metadata
             for back in range(4, min(200, meta_pos), 4):
                 check_pos = meta_pos - back
-                try:
-                    str_len = struct.unpack_from('<I', intern_data, check_pos)[0]
-                    if 5 < str_len < 200 and check_pos + 4 + str_len <= meta_pos:
-                        desc_bytes = intern_data[check_pos + 4:check_pos + 4 + str_len]
-                        desc = desc_bytes.decode('cp1252', errors='replace').rstrip('\x00').strip()
-                        if desc and len(desc) > 5 and all(c.isprintable() or c in ' \t' for c in desc):
-                            description = desc
-                            break
-                except (struct.error, UnicodeDecodeError):
-                    pass
+                str_len = _U32(intern_data, check_pos)[0]
+                if 5 < str_len < 200 and check_pos + 4 + str_len <= meta_pos:
+                    desc_bytes = intern_data[check_pos + 4:check_pos + 4 + str_len]
+                    desc = _decode_cp1252(desc_bytes).rstrip('\x00').strip()
+                    if desc and len(desc) > 5 and all(c.isprintable() or c in ' \t' for c in desc):
+                        description = desc
+                        break
 
         return Parameter(
             name=name,
@@ -427,54 +945,58 @@ class OLSReader:
             y_axis=y_axis,
         )
 
+    # -------------------------------------------------------------------
+    # Header
+    # -------------------------------------------------------------------
+
     def _read_u16(self, offset: int) -> int:
         """Read unsigned 16-bit little-endian value"""
-        return struct.unpack_from('<H', self.data, offset)[0]
+        return int(_U16(self.data, offset)[0])
 
     def _read_u32(self, offset: int) -> int:
         """Read unsigned 32-bit little-endian value"""
-        return struct.unpack_from('<I', self.data, offset)[0]
+        return int(_U32(self.data, offset)[0])
 
     def _read_string(self, offset: int) -> tuple[str, int]:
         """Read length-prefixed string, return (string, bytes_consumed)"""
+        if offset + 4 > len(self.data):
+            return "", 0
         length = self._read_u32(offset)
         if length == 0 or length > 500:
             return "", 4
         # OLS files use Windows-1252 encoding (Western European), not UTF-8
-        s = self.data[offset + 4:offset + 4 + length].decode('cp1252', errors='replace')
+        s = _decode_cp1252(self.data[offset + 4:offset + 4 + length])
         s = s.rstrip('\x00').strip()
         return s, 4 + length
 
-    def _parse_header(self, ols: OLSFile) -> bool:
+    def _parse_header(self, ols: OLSFile) -> None:
         """
         Parse OLS file header.
 
         Header structure:
-        - [0-3]   Magic number (0x0b)
+        - [0-3]   Magic number (0x0b, the length of the signature string)
         - [4-15]  Signature "WinOLS File"
         - [16-17] Version (u16)
-        - [18-21] Flags (u32)
-        - [22+]   Length-prefixed strings (up to 15):
+        - [18-23] Flags / timestamp
+        - [24+]   Length-prefixed strings (up to 15):
                    make, model, engine, year, fuel_type, displacement, power,
                    gearbox, memory_type, ecu_manufacturer, ecu_type, sw_number,
                    hw_number, hw_code, user
 
         Older OLS versions may have fewer strings (minimum 4).
         v597+ typically have all 15 strings (some may be empty).
-        """
-        # Check magic
-        if self._read_u32(0) != 0x0b:
-            return False
 
-        # Check signature
-        sig = self.data[4:16].decode('ascii', errors='replace').rstrip('\x00')
-        if not sig.startswith("WinOLS File"):
-            return False
+        Raises:
+            OLSFormatError: magic number or signature do not match.
+        """
+        if (len(self.data) < 18 or
+                self._read_u32(0) != _OLS_MAGIC or
+                not self.data[4:16].decode('ascii', errors='replace').startswith(_OLS_SIGNATURE)):
+            raise OLSFormatError(f"{self.filepath.name}: not a WinOLS file (missing '{_OLS_SIGNATURE}' header)")
 
         # Read version (determines structure format)
         self.version = self._read_u16(16)
 
-        # Structure: magic(4) + sig(12) + version(2) + flags/timestamp(6) = 24 bytes
         # Then length-prefixed strings starting at 0x18
         pos = 0x18
 
@@ -500,18 +1022,32 @@ class OLSReader:
         for field_name in extended_fields:
             if pos + 4 >= len(self.data):
                 break
-            val, consumed = self._read_string(pos)
-            if consumed <= 0:
-                break
             # Stop if the length field looks like non-string data
             # (length-prefixed strings should have length < 200)
-            raw_len = self._read_u32(pos)
-            if raw_len > 200:
+            if self._read_u32(pos) > 200:
                 break
+            val, consumed = self._read_string(pos)
             setattr(ols, field_name, val)
             pos += consumed
 
-        return True
+    # -------------------------------------------------------------------
+    # Binary versions
+    # -------------------------------------------------------------------
+
+    def _read_text_field(self, pos: int) -> tuple[str, int]:
+        """
+        Read an optional u32-length-prefixed description at ``pos``.
+
+        Returns (text, declared_length) where declared_length is 0 when no
+        plausible description is present.
+        """
+        data = self.data
+        if pos + 4 > len(data):
+            return "", 0
+        length = self._read_u32(pos)
+        if 0 < length < 500 and pos + 4 + length <= len(data):
+            return _decode_cp1252(data[pos + 4:pos + 4 + length]).strip(), length
+        return "", 0
 
     def _extract_binary_versions(self) -> list[BinaryVersion]:
         """
@@ -530,125 +1066,103 @@ class OLSReader:
             Blob storage layout: blob_offset + i * blob_size for version i.
             file_size == blob_offset + version_count * blob_size + 4 (0xFFFFFFFF trailer).
         """
-        versions = []
+        data = self.data
+        size = len(data)
+        versions: list[BinaryVersion] = []
 
-        BLOB_MARKER = 0x42007899
-        marker_bytes = struct.pack('<I', BLOB_MARKER)
-        scan_start = 0x100
-        scan_end = min(0x2000, len(self.data) - 28)
+        scan_end = min(0x2000, size - 28)
+        marker_pos = data.find(_BLOB_MARKER, 0x100, scan_end)
 
-        base_found = False
-        marker_pos = self.data.find(marker_bytes, scan_start, scan_end)
-
-        while marker_pos >= 0 and not base_found:
+        while marker_pos >= 0:
             # Base record: marker is at offset +12 from record start
             rec_start = marker_pos - 12
-            if rec_start < 0:
-                marker_pos = self.data.find(marker_bytes, marker_pos + 4, scan_end)
-                continue
-
-            version_index = self._read_u32(rec_start)
-            blob_offset = self._read_u32(rec_start + 4)
-            blob_size = self._read_u32(rec_start + 8)
-            # marker at rec_start + 12
-            version_count = self._read_u32(rec_start + 16)
-            name_len = self._read_u32(rec_start + 20)
+            version_index, blob_offset, blob_size = _U32X3(data, rec_start)
+            version_count, name_len = _U32X2(data, rec_start + 16)
 
             # Validate base record structure
             if (version_index < 20 and
-                version_count > 0 and version_count <= 20 and
-                version_index < version_count and
-                0x10000 <= blob_size <= 0x10000000 and
-                blob_offset + version_count * blob_size <= len(self.data) + 4 and
-                0 < name_len < 50 and
-                rec_start + 24 + name_len <= len(self.data)):
-
+                    0 < version_count <= 20 and
+                    version_index < version_count and
+                    0x10000 <= blob_size <= 0x10000000 and
+                    blob_offset + version_count * blob_size <= size + 4 and
+                    0 < name_len < 50 and
+                    rec_start + 24 + name_len <= size):
                 try:
-                    name = self.data[rec_start + 24:rec_start + 24 + name_len].decode('cp1252')
-                    if name.isprintable() and name.strip():
-                        name_clean = name.strip()
+                    name = data[rec_start + 24:rec_start + 24 + name_len].decode('cp1252')
+                except UnicodeDecodeError:
+                    name = ""
+                if name.isprintable() and name.strip():
+                    desc, _ = self._read_text_field(rec_start + 24 + name_len)
+                    versions.append(BinaryVersion(
+                        name=name.strip(),
+                        blob_offset=blob_offset + version_index * blob_size,
+                        blob_size=blob_size,
+                        version_index=version_index,
+                        version_count=version_count,
+                        description=desc,
+                    ))
+                    versions.extend(self._extract_derived_versions(
+                        marker_pos + 4, blob_offset, blob_size, version_index, version_count))
+                    break
 
-                        # Read description after name
-                        desc = ""
-                        desc_pos = rec_start + 24 + name_len
-                        if desc_pos + 4 <= len(self.data):
-                            desc_len = self._read_u32(desc_pos)
-                            if 0 < desc_len < 500 and desc_pos + 4 + desc_len <= len(self.data):
-                                desc = self.data[desc_pos + 4:desc_pos + 4 + desc_len].decode('cp1252', errors='replace').strip()
-
-                        actual_blob_offset = blob_offset + version_index * blob_size
-
-                        versions.append(BinaryVersion(
-                            name=name_clean,
-                            blob_offset=actual_blob_offset,
-                            blob_size=blob_size,
-                            version_index=version_index,
-                            version_count=version_count,
-                            description=desc,
-                        ))
-
-                        base_found = True
-
-                        # Scan forward for derived records (0xFFFFFFFF sentinel)
-                        derived_search_start = marker_pos + 4
-                        derived_search_end = min(derived_search_start + 0x500, len(self.data) - 8)
-                        derived_index = 0  # Next slot to assign
-
-                        d_pos = derived_search_start
-                        while d_pos < derived_search_end:
-                            if self._read_u32(d_pos) == 0xFFFFFFFF:
-                                if d_pos + 8 <= len(self.data):
-                                    d_name_len = self._read_u32(d_pos + 4)
-                                    if (0 < d_name_len < 50 and
-                                        d_pos + 8 + d_name_len <= len(self.data)):
-                                        try:
-                                            d_name = self.data[d_pos + 8:d_pos + 8 + d_name_len].decode('cp1252')
-                                            if d_name.isprintable() and d_name.strip():
-                                                # Skip base record's index
-                                                while derived_index == version_index:
-                                                    derived_index += 1
-                                                if derived_index >= version_count:
-                                                    break
-
-                                                d_desc = ""
-                                                d_desc_pos = d_pos + 8 + d_name_len
-                                                if d_desc_pos + 4 <= len(self.data):
-                                                    d_desc_len = self._read_u32(d_desc_pos)
-                                                    if 0 < d_desc_len < 500 and d_desc_pos + 4 + d_desc_len <= len(self.data):
-                                                        d_desc = self.data[d_desc_pos + 4:d_desc_pos + 4 + d_desc_len].decode('cp1252', errors='replace').strip()
-
-                                                d_blob_offset = blob_offset + derived_index * blob_size
-
-                                                versions.append(BinaryVersion(
-                                                    name=d_name.strip(),
-                                                    blob_offset=d_blob_offset,
-                                                    blob_size=blob_size,
-                                                    version_index=derived_index,
-                                                    version_count=version_count,
-                                                    description=d_desc,
-                                                ))
-
-                                                derived_index += 1
-                                                # Skip past this derived record
-                                                d_pos = d_desc_pos + (4 + d_desc_len if d_desc else 4)
-                                                continue
-                                        except (UnicodeDecodeError, ValueError):
-                                            pass
-                            d_pos += 1
-
-                except (UnicodeDecodeError, ValueError):
-                    pass
-
-            if not base_found:
-                marker_pos = self.data.find(marker_bytes, marker_pos + 4, scan_end)
+            marker_pos = data.find(_BLOB_MARKER, marker_pos + 4, scan_end)
 
         # Find EPK/verification info for each binary version
         for v in versions:
             if v.blob_offset > 0 and v.blob_size > 0:
-                epk, epk_offset = self._find_binary_verification(v.blob_offset, v.blob_size)
-                v.epk = epk
-                v.epk_offset = epk_offset
+                v.epk, v.epk_offset = self._find_binary_verification(v.blob_offset, v.blob_size)
 
+        return versions
+
+    def _extract_derived_versions(
+        self,
+        start: int,
+        blob_offset: int,
+        blob_size: int,
+        base_index: int,
+        version_count: int,
+    ) -> list[BinaryVersion]:
+        """Scan up to 0x500 bytes after the base record for derived records."""
+        data = self.data
+        size = len(data)
+        versions: list[BinaryVersion] = []
+        search_end = min(start + 0x500, size - 8)
+        derived_index = 0  # Next slot to assign
+
+        pos = start
+        while pos < search_end:
+            # find() only reports markers that start before search_end
+            pos = data.find(_DERIVED_MARKER, pos, search_end + 3)
+            if pos < 0:
+                break
+            name_len = self._read_u32(pos + 4)
+            if 0 < name_len < 50 and pos + 8 + name_len <= size:
+                try:
+                    name = data[pos + 8:pos + 8 + name_len].decode('cp1252')
+                except UnicodeDecodeError:
+                    name = ""
+                if name.isprintable() and name.strip():
+                    # Skip base record's index
+                    if derived_index == base_index:
+                        derived_index += 1
+                    if derived_index >= version_count:
+                        break
+
+                    desc_pos = pos + 8 + name_len
+                    desc, desc_len = self._read_text_field(desc_pos)
+                    versions.append(BinaryVersion(
+                        name=name.strip(),
+                        blob_offset=blob_offset + derived_index * blob_size,
+                        blob_size=blob_size,
+                        version_index=derived_index,
+                        version_count=version_count,
+                        description=desc,
+                    ))
+                    derived_index += 1
+                    # Skip past this derived record
+                    pos = desc_pos + (4 + desc_len if desc else 4)
+                    continue
+            pos += 1
         return versions
 
     def _find_binary_verification(self, blob_offset: int, blob_size: int) -> tuple[str, int]:
@@ -667,7 +1181,7 @@ class OLSReader:
         # Simos12 (TC1797): SC1, SA3 -> 0x40000
         # Simos16: SC4 -> 0x100000
         # MED17: S82, S85 -> 0x40000
-        cal_offsets = [0x40000, 0x100000, 0x800000, 0x820000, 0x0]
+        cal_offsets = (0x40000, 0x100000, 0x800000, 0x820000, 0x0)
 
         # Method 1: Search at known CAL offsets within binary
         for cal_off in cal_offsets:
@@ -678,199 +1192,81 @@ class OLSReader:
             if pos + 20 > len(self.data):
                 continue
 
-            header = self.data[pos:pos + 20]
-            epk, rel_offset = self._extract_epk_from_header(header)
+            epk, rel_offset = self._extract_epk_from_header(self.data[pos:pos + 20])
             if epk:
                 return epk, cal_off + rel_offset
 
         # Method 2: Search entire file for CAS pattern (for files where CAL is separate)
-        cas_pattern = rb'CAS[A-Z][A-Z0-9]{4}'
-        for match in re.finditer(cas_pattern, self.data):
-            cas_pos = match.start()
-            # EPK is 8 bytes after CAS
-            epk_pos = cas_pos + 8
-            if epk_pos + 7 <= len(self.data):
-                epk_bytes = self.data[epk_pos:epk_pos + 7]
-                epk = epk_bytes.split(b'\x00')[0].decode('ascii', errors='replace')
-                if epk and len(epk) >= 6 and epk[0] == 'S':
-                    # Calculate offset relative to binary start
-                    rel_offset = cas_pos - blob_offset + 8
-                    # Use known CAL offset based on EPK prefix
-                    known_offset = self._get_cal_offset_for_epk(epk)
-                    if known_offset > 0:
-                        return epk, known_offset + 8  # +8 for CAS header
-                    return epk, rel_offset if rel_offset >= 0 else 0
+        found = self._first_cas_epk()
+        if found is None:
+            return "", 0
+        cas_pos, epk = found
+        # Use known CAL offset based on EPK prefix
+        known_offset = self._get_cal_offset_for_epk(epk)
+        if known_offset > 0:
+            return epk, known_offset + 8  # +8 for CAS header
+        # Calculate offset relative to binary start
+        rel_offset = cas_pos - blob_offset + 8
+        return epk, rel_offset if rel_offset >= 0 else 0
 
-        return "", 0
+    def _first_cas_epk(self) -> Optional[tuple[int, str]]:
+        """First CAS header in the file followed by a plausible EPK (cached)."""
+        if self._cas_epk is _UNSET:
+            self._cas_epk = None
+            data = self.data
+            for match in _CAS_RE.finditer(data):
+                # EPK is 8 bytes after CAS
+                epk_pos = match.start() + 8
+                if epk_pos + 7 <= len(data):
+                    epk = data[epk_pos:epk_pos + 7].split(b'\x00')[0].decode('ascii', errors='replace')
+                    if len(epk) >= 6 and epk[0] == 'S':
+                        self._cas_epk = (match.start(), epk)
+                        break
+        return self._cas_epk
 
     def _extract_epk_from_header(self, header: bytes) -> tuple[str, int]:
         """Extract EPK from a 20-byte header area."""
         # Look for CAS header, EPK follows at +8
-        cas_match = re.search(rb'CAS[A-Z][A-Z0-9]{4}', header)
+        cas_match = _CAS_RE.search(header)
         if cas_match:
             epk_pos = cas_match.start() + 8
             if epk_pos + 7 <= len(header):
-                epk_bytes = header[epk_pos:epk_pos + 7]
-                epk = epk_bytes.split(b'\x00')[0].decode('ascii', errors='replace')
-                if epk and len(epk) >= 6:
+                epk = header[epk_pos:epk_pos + 7].split(b'\x00')[0].decode('ascii', errors='replace')
+                if len(epk) >= 6:
                     return epk, epk_pos
 
         # Direct EPK search (for files without CAS header)
-        epk_match = re.search(rb'S[A-Z][0-9A-Z]{5}\x00', header)
+        epk_match = _EPK_RE.search(header)
         if epk_match:
-            epk = epk_match.group()[:-1].decode('ascii')
-            return epk, epk_match.start()
+            return epk_match.group()[:-1].decode('ascii'), epk_match.start()
 
         return "", 0
 
     def _get_cal_offset_for_epk(self, epk: str) -> int:
-        """Return CAL offset based on EPK prefix (for full bin files)."""
+        """Return CAL offset based on EPK prefix (for full bin files), 0 if unknown."""
         epk_upper = epk.upper()
-        # Simos18.10 (Aurix TC29x)
-        if epk_upper.startswith('SCG'):
-            return 0x820000
-        # Simos18.1 (TC1793)
-        if epk_upper.startswith('SC8'):
-            return 0x800000
-        # Simos12 (TC1797)
-        if epk_upper.startswith('SC1') or epk_upper.startswith('SA3'):
-            return 0x40000
-        # Simos16
-        if epk_upper.startswith('SC4'):
-            return 0x100000
-        # MED17
-        if epk_upper.startswith('S82') or epk_upper.startswith('S85'):
-            return 0x40000
-        # Default
+        for prefixes, offset in _CAL_OFFSETS_BY_EPK:
+            if epk_upper.startswith(prefixes):
+                return offset
         return 0
 
     # -------------------------------------------------------------------
-    # Sequential reading primitives (advance self.pos)
+    # Parameters (map list)
     # -------------------------------------------------------------------
 
-    def _seq_read_u8(self) -> int:
-        if self.pos + 1 > len(self.data):
-            raise EOFError(f"read_u8 at 0x{self.pos:x}")
-        val = self.data[self.pos]
-        self.pos += 1
-        return val
-
-    def _seq_read_bool(self) -> bool:
-        return self._seq_read_u8() != 0
-
-    def _seq_read_u16(self) -> int:
-        if self.pos + 2 > len(self.data):
-            raise EOFError(f"read_u16 at 0x{self.pos:x}")
-        val = struct.unpack_from('<H', self.data, self.pos)[0]
-        self.pos += 2
-        return val
-
-    def _seq_read_u32(self) -> int:
-        if self.pos + 4 > len(self.data):
-            raise EOFError(f"read_u32 at 0x{self.pos:x}")
-        val = struct.unpack_from('<I', self.data, self.pos)[0]
-        self.pos += 4
-        return val
-
-    def _seq_read_i32(self) -> int:
-        if self.pos + 4 > len(self.data):
-            raise EOFError(f"read_i32 at 0x{self.pos:x}")
-        val = struct.unpack_from('<i', self.data, self.pos)[0]
-        self.pos += 4
-        return val
-
-    def _seq_read_f64(self) -> float:
-        if self.pos + 8 > len(self.data):
-            raise EOFError(f"read_f64 at 0x{self.pos:x}")
-        val = struct.unpack_from('<d', self.data, self.pos)[0]
-        self.pos += 8
-        return val
-
-    def _seq_read_bytes(self, count: int) -> bytes:
-        if self.pos + count > len(self.data):
-            raise EOFError(f"read_bytes({count}) at 0x{self.pos:x}")
-        result = self.data[self.pos:self.pos + count]
-        self.pos += count
-        return result
-
-    def _seq_read_array(self) -> bytes:
-        """Read u32(byte_count) + byte_count bytes."""
-        count = self._seq_read_u32()
-        if count == 0 or count >= 0xFFFFFFF0:
-            return b""
-        if count > 0x1000000:
-            raise ValueError(f"read_array at 0x{self.pos:x}: count {count}")
-        if self.pos + count > len(self.data):
-            raise EOFError(f"read_array at 0x{self.pos:x}: need {count}")
-        result = self.data[self.pos:self.pos + count]
-        self.pos += count
-        return result
-
-    def _seq_read_u32_array(self) -> list[int]:
-        count = self._seq_read_u32()
-        if count == 0:
-            return []
-        if count > 0x100000:
-            raise ValueError(f"read_u32_array: count {count}")
-        return [self._seq_read_u32() for _ in range(count)]
-
-    def _seq_read_string(self) -> str:
-        """Read version-aware length-prefixed string."""
-        length = self._seq_read_u32()
-        if length == 0 or length >= 0xFFFFFFF0:
-            return ""
-        if length > 0x100000:
-            raise ValueError(f"read_string at 0x{self.pos:x}: length {length}")
-        if self.pos + length > len(self.data):
-            raise EOFError(f"read_string at 0x{self.pos:x}: need {length}")
-        raw = self.data[self.pos:self.pos + length]
-        if self._has_feature(439):
-            self.pos += length
-        else:
-            self.pos += length + 1
-        return raw.decode('cp1252', errors='replace').rstrip('\x00')
-
-    def _seq_read_string_array(self) -> list[str]:
-        count = self._seq_read_u32()
-        return [self._seq_read_string() for _ in range(count)]
-
-    def _seq_read_lang_string(self) -> str:
-        s = self._seq_read_string()
-        if self._has_feature(345):
-            self._seq_read_u32()  # lang_id
-        return s
-
-    def _seq_read_multi_lang_string(self) -> str:
-        if not self._has_feature(330):
-            return self._seq_read_string()
-        primary = self._seq_read_lang_string()
-        if self._has_feature(345):
-            self._seq_read_u32()  # flags
-        sub_count = self._seq_read_u32()
-        for _ in range(sub_count):
-            self._seq_read_lang_string()
-        return primary
-
-    def _has_feature(self, feature_id: int) -> bool:
-        return feature_id <= self.version
-
-    # -------------------------------------------------------------------
-    # Sequential map list detection
-    # -------------------------------------------------------------------
-
-    def _find_map_list_start(self) -> Optional[tuple[int, int]]:
+    def _find_map_list_start(self) -> Optional[tuple[bytes, int, int]]:
         """
-        Find the map list start position and count.
+        Find the map list and return (buffer, first_map_pos, map_count).
 
         The map list is preceded by checksum 0x11883377, then:
         - compressed (bool/u8)
         - count (u32)
-        - map records
+        - map records (zlib-compressed if the flag is set; ``buffer`` is then
+          the inflated data and ``first_map_pos`` is 0)
 
-        Returns (first_map_pos, map_count) or None.
+        Returns None if no usable map list is present.
         """
-        needle = struct.pack('<I', 0x11883377)
-        idx = self.data.find(needle, 0x100, 0x20000)
+        idx = self.data.find(_MAP_LIST_MARKER, 0x100, 0x20000)
         if idx < 0:
             return None
 
@@ -879,328 +1275,38 @@ class OLSReader:
             return None
 
         compressed = self.data[pos]
-        count = struct.unpack_from('<I', self.data, pos + 1)[0]
+        count = self._read_u32(pos + 1)
         first_map = pos + 5
 
         if compressed:
-            import zlib
-            # Compressed map list: remaining data after count is zlib-compressed
-            try:
-                raw = zlib.decompress(self.data[first_map:])
-                # Replace data temporarily for sequential reading
-                self._compressed_backup = self.data
-                self.data = self.data[:first_map] + raw
-                return (first_map, count)
-            except zlib.error:
+            raw = self._inflate(first_map)
+            if raw is None:
                 return None
+            return raw, 0, count
 
         if count == 0 or count > 0x100000:
             return None
 
-        return (first_map, count)
+        return self.data, first_map, count
 
-    # -------------------------------------------------------------------
-    # Sequential axis unit descriptor reader
-    # -------------------------------------------------------------------
-
-    def _seq_read_axis_unit_desc(self) -> tuple[str, float, float, int, int]:
-        """
-        Read axis unit descriptor.
-        Returns (unit, factor, offset, data_offset, end_offset).
-        """
-        unit = self._seq_read_string()
-        self._seq_read_string()  # alt_unit
-        factor = self._seq_read_f64()
-        offset = self._seq_read_f64()
-        data_offset = self._seq_read_u32()
-        end_offset = self._seq_read_u32()
-        self._seq_read_u32()  # field_4c
-        if self._has_feature(264):
-            self._seq_read_f64()
-        if self._has_feature(61):
-            self._seq_read_u32()
-        if self._has_feature(105):
-            self._seq_read_u32()
-            self._seq_read_u32()
-            self._seq_read_u32()
-            self._seq_read_i32()
-        return (unit, factor, offset, data_offset, end_offset)
-
-    # -------------------------------------------------------------------
-    # Sequential axis data reader
-    # -------------------------------------------------------------------
-
-    def _seq_read_axis_data(self) -> AxisInfo:
-        """Read a single axis data block.
-
-        Layout per COlsAxisData_ReadFromFile (Ghidra: 0x003d1684):
-            multi_lang_string  description
-            string             axis_id (unit)
-            double             factor
-            double             offset
-            u32 (type_code)    axis+0x64
-            u32                axis+0x70  — axis data address (where breakpoints live)
-            u32                axis+0x74  — type_kind: 1=UBYTE, 3=UWORD, 5=ULONG, 7=FLOAT32
-                                            (same encoding as param data_type;
-                                             read via COlsMap_ReadField98)
-            u32                axis+0x78  — byte width (1/2/4) — derivable from type_kind
-            u32                axis+0x7c  — data_format (validated 2/10/16, always 0xa
-                                             empirically; not the real type)
-            bool, bool, ...    feature-gated
-
-        NOTE: the breakpoint COUNT is not in this block — it comes from the
-        param header (cols for X, rows for Y); _seq_read_one_map fills it in.
-        """
-        description = self._seq_read_multi_lang_string()
-        axis_id = self._seq_read_string()
-        factor = self._seq_read_f64()
-        offset = self._seq_read_f64()
-        type_code = self._seq_read_u32()
-        axis_address = self._seq_read_u32()
-        type_kind = self._seq_read_u32()  # 1/3/5/7 → byte/word/long/float
-        self._seq_read_u32()  # byte width — redundant
-        self._seq_read_u32()  # data_format — always 0xa, ignored
-        data_type = {1: "UBYTE", 3: "UWORD", 5: "ULONG", 7: "FLOAT32"}.get(type_kind, "UWORD")
-        self._seq_read_bool()
-        self._seq_read_bool()
-        if self._has_feature(264):
-            self._seq_read_f64()
-        if self._has_feature(241):
-            self._seq_read_u32()
-        data_source = 0
-        if self._has_feature(8):
-            data_source = self._seq_read_u32()
-        if self._has_feature(805):
-            self._seq_read_u32()
-        if self._has_feature(12):
-            self._seq_read_bool()
-        if self._has_feature(73):
-            self._seq_read_array()
-        if self._has_feature(77):
-            self._seq_read_u32()
-        if self._has_feature(91):
-            self._seq_read_i32()
-        if self._has_feature(354):
-            self._seq_read_string()
-        if self._has_feature(372):
-            count_372 = self._seq_read_u32()
-            for _ in range(count_372):
-                self._seq_read_multi_lang_string()
-        if self._has_feature(440):
-            self._seq_read_i32()
-        if self._has_feature(805):
-            self._seq_read_u32()
-            self._seq_read_u32()
-            self._seq_read_u32()
-            self._seq_read_u32()
-        return AxisInfo(
-            points=0,
-            address=axis_address,
-            unit="",
-            factor=factor,
-            offset=offset,
-            id=axis_id,
-            description=description,
-            data_source=data_source,
-            data_type=data_type,
-        )
-
-    # -------------------------------------------------------------------
-    # Sequential map reader
-    # -------------------------------------------------------------------
-
-    def _seq_read_one_map(self) -> Parameter:
-        """Read a single map record sequentially."""
-        if self._has_feature(268):
-            self._seq_read_u8()
-        if self._has_feature(282):
-            self._seq_read_u32()
-        alt_description = ""
-        if self._has_feature(287):
-            alt_description = self._seq_read_multi_lang_string()
-        if self._has_feature(93):
-            self._seq_read_u8()
-
-        description = self._seq_read_multi_lang_string()
-        type_code = self._seq_read_u32()
-        self._seq_read_u32()
-        # 3rd u32 in this block is the value-type code: 1=byte, 3=word, 5=long, 7=float32.
-        # OLS does not record signedness — consumers overlay that from sister A2L if needed.
-        type_kind = self._seq_read_u32()
-        self._seq_read_u32()  # byte width (1/2/4) — redundant, derivable from type_kind
-        self._seq_read_u32()  # legacy field, observed always 0x0a in v303/v357/v479
-        data_type = {1: "UBYTE", 3: "UWORD", 5: "ULONG", 7: "FLOAT32"}.get(type_kind, "UWORD")
-
-        name = ""
-        folder_id = 0
-        if self._has_feature(80):
-            folder_id = self._seq_read_u32()
-            if folder_id > 1000:
-                folder_id = 0
-            name = self._seq_read_string()
-        if self._has_feature(298):
-            self._seq_read_u32()
-        if self._has_feature(299):
-            self._seq_read_u32()
-        if self._has_feature(94):
-            self._seq_read_u32()
-        if self._has_feature(74):
-            self._seq_read_bool()
-
-        # File mode check (OLS files always use mode 1)
-        file_mode = 1
-        if file_mode == 1:
-            if self._has_feature(123):
-                self._seq_read_u32()
-        elif file_mode == 3:
-            if self._has_feature(221):
-                self._seq_read_u32()
-
-        if self._has_feature(300):
-            for _ in range(6):
-                self._seq_read_f64()
-        if self._has_feature(67):
-            if self._has_feature(300):
-                for _ in range(6):
-                    self._seq_read_f64()
-            else:
-                for _ in range(6):
-                    self._seq_read_f64()
-        elif self._has_feature(66):
-            self._seq_read_f64()
-            self._seq_read_f64()
-        elif not self._has_feature(59):
-            self._seq_read_u32()
-            self._seq_read_u32()
-
-        for _ in range(4):
-            self._seq_read_bool()
-
-        dim1 = self._seq_read_u32()
-        dim2 = self._seq_read_u32()
-        self._seq_read_u32()
-        self._seq_read_u32()
-        self._seq_read_u32()
-
-        # Axis unit descriptor
-        unit_str, factor, conv_offset, data_offset, axis_offset = self._seq_read_axis_unit_desc()
-
-        # Two axis data blocks
-        axis1 = self._seq_read_axis_data()
-        axis2 = self._seq_read_axis_data()
-
-        if dim1 > 0x4000:
-            dim1 = 0x4000
-
-        if self._has_feature(58):
-            self._seq_read_bool()
-        if self._has_feature(68):
-            self._seq_read_bool()
-        if self._has_feature(90):
-            self._seq_read_u32()
-        if self._has_feature(9):
-            self._seq_read_u32()
-            self._seq_read_u32()
-        if self._has_feature(49):
-            self._seq_read_u32()
-            self._seq_read_bool()
-            self._seq_read_bool()
-            self._seq_read_f64()
-            self._seq_read_f64()
-        if self._has_feature(51):
-            self._seq_read_u32()
-        if self._has_feature(53):
-            self._seq_read_bool()
-            self._seq_read_f64()
-            self._seq_read_f64()
-            self._seq_read_f64()
-            self._seq_read_u32()
-        if self._has_feature(54):
-            self._seq_read_f64()
-        if self._has_feature(55):
-            self._seq_read_bool()
-            self._seq_read_bool()
-            self._seq_read_bool()
-        if self._has_feature(315):
-            self._seq_read_u32()
-        if self._has_feature(383):
-            self._seq_read_i32()
-            self._seq_read_bytes(16)
-        if self._has_feature(329):
-            self._seq_read_u32()
-        if self._has_feature(346):
-            self._seq_read_u32()
-            self._seq_read_u32()
-        if self._has_feature(395):
-            self._seq_read_u32()
-        if self._has_feature(476):
-            self._seq_read_u32()
-            self._seq_read_u32_array()
-            self._seq_read_string_array()
-        if self._has_feature(503):
-            self._seq_read_u32()
-            self._seq_read_f64()
-        if self._has_feature(596):
-            self._seq_read_u32()
-        if self._has_feature(822):
-            self._seq_read_u32()
-
-        # Derive parameter type
-        type_map = {1: "VALUE", 2: "VALUE", 3: "CURVE", 4: "MAP", 5: "MAP"}
-        param_type = type_map.get(type_code, "MAP" if type_code > 5 else "VALUE")
-
-        # Derive dimensions
-        if type_code <= 2:
-            cols = max(1, dim1)
-            rows = 1
-        elif type_code == 3:
-            cols = max(1, dim1)
-            rows = 1
-        else:
-            cols = max(1, dim1)
-            rows = max(1, dim2)
-        if cols > 0x4000:
-            cols = 1
-        if rows > 0x4000:
-            rows = 1
-
-        # Assign axes. Each axis carries its own address (axis+0x70) read from
-        # the OLS. The point count comes from the param header (cols for X,
-        # rows for Y) — the axis block itself doesn't store it.
-        x_axis = None
-        y_axis = None
-        if param_type == "CURVE":
-            x_axis = axis1
-            if x_axis:
-                x_axis.points = cols
-        elif param_type == "MAP":
-            y_axis = axis1
-            x_axis = axis2
-            if y_axis:
-                y_axis.points = rows
-            if x_axis:
-                x_axis.points = cols
-
-        return Parameter(
-            name=name,
-            description=description,
-            param_type=param_type,
-            data_type=data_type,
-            cols=cols,
-            rows=rows,
-            data_offset=data_offset,
-            x_axis=x_axis,
-            y_axis=y_axis,
-            unit=unit_str,
-            factor=factor,
-            offset=conv_offset,
-            type_code=type_code,
-            folder_id=folder_id,
-        )
-
-    # -------------------------------------------------------------------
-    # Parameter extraction (sequential)
-    # -------------------------------------------------------------------
+    def _inflate(self, start: int) -> Optional[bytes]:
+        """Inflate the zlib stream at ``start``, bounded by max_decompressed_size."""
+        limit = self.max_decompressed_size
+        inflater = zlib.decompressobj()
+        try:
+            raw = inflater.decompress(memoryview(self.data)[start:], limit + 1)
+        except zlib.error as exc:
+            self._warn(f"compressed map list is corrupt: {exc}")
+            return None
+        if len(raw) > limit:
+            raise OLSLimitError(
+                f"{self.filepath.name}: compressed map list inflates beyond "
+                f"{limit} bytes (raise max_decompressed_size to allow it)"
+            )
+        if not inflater.eof:
+            self._warn("compressed map list is truncated")
+            return None
+        return raw
 
     def _extract_parameters(self) -> list[Parameter]:
         """
@@ -1213,26 +1319,27 @@ class OLSReader:
         if found is None:
             return []
 
-        first_map_pos, map_count = found
-        self.pos = first_map_pos
-        parameters = []
+        buf, pos, map_count = found
+        read_map = _MapRecordReader(buf, self.version).read_map
+        parameters: list[Parameter] = []
 
-        for _ in range(map_count):
+        for index in range(map_count):
             try:
-                p = self._seq_read_one_map()
-                # Skip Hexdump entries — not real parameters
-                if p.description == "Hexdump" and not p.name:
-                    continue
-                parameters.append(p)
-            except (EOFError, ValueError, struct.error):
+                param, pos = read_map(pos)
+            except (EOFError, ValueError, struct.error) as exc:
+                self._warn(f"map list ends after {index} of {map_count} records: {exc}")
                 break
+            # Skip Hexdump entries — not real parameters
+            if param.description == "Hexdump" and not param.name:
+                continue
+            parameters.append(param)
 
-        # Restore original data if we decompressed
-        if hasattr(self, '_compressed_backup'):
-            self.data = self._compressed_backup
-            del self._compressed_backup
-
+        self.pos = pos
         return parameters
+
+    # -------------------------------------------------------------------
+    # CAL block and folders
+    # -------------------------------------------------------------------
 
     def _extract_cal_block(self) -> Optional[CALBlock]:
         """
@@ -1242,53 +1349,36 @@ class OLSReader:
         - Identified by "CAS" + 5 alphanumeric chars (e.g., "CASC2E55")
         - EPK string at offset 8 (e.g., "SC8F830")
         - Binary data follows, typically 0.5-2 MB
-        - End marked by large 0xFF section or EOF
+        - End marked by more than 32 KiB of 0xFF fill or EOF; the size is
+          rounded up to a 4 KiB boundary (relative to the CAL start)
         """
-        # Find CAS signature
-        pattern = rb'CAS[A-Z][A-Z0-9]{4}'
-        match = re.search(pattern, self.data)
-
+        data = self.data
+        match = _CAS_RE.search(data)
         if not match:
             return None
 
         offset = match.start()
-
-        # Read CAS ID and EPK
-        cas_id = self.data[offset:offset + 8].decode('ascii', errors='replace')
+        cas_id = data[offset:offset + 8].decode('ascii', errors='replace')
 
         # EPK is at offset 8, typically 7 chars
-        epk_area = self.data[offset + 8:offset + 30].decode('ascii', errors='replace')
-        epk_match = re.match(r'(S[A-Z][0-9A-Z]{5})', epk_area)
+        epk_match = _EPK_TEXT_RE.match(data[offset + 8:offset + 30].decode('ascii', errors='replace'))
         epk = epk_match.group(1) if epk_match else ""
 
         # Find CAL end (large 0xFF section or EOF)
-        end = min(offset + 0x200000, len(self.data))
-        ff_count = 0
+        end = min(offset + _CAL_MAX_SIZE, len(data))
+        fill = data.find(_CAL_FILL_RUN, offset + _CAL_MIN_SIZE, end)
+        if fill >= 0:
+            end = fill
 
-        for i in range(offset + 0x10000, end):
-            if self.data[i] == 0xff:
-                ff_count += 1
-                if ff_count > 0x8000:  # 32KB of 0xFF
-                    end = i - ff_count
-                    break
-            else:
-                ff_count = 0
-
-        # Align to 4KB boundary
-        end = ((end + 0xfff) // 0x1000) * 0x1000
-        end = min(end, len(self.data))
-
-        cal_data = self.data[offset:end]
-
-        # Verify it starts with CAS
-        if not cal_data[:3] == b'CAS':
-            return None
+        # Align the CAL size to 4KB
+        size = (end - offset + _CAL_ALIGN - 1) // _CAL_ALIGN * _CAL_ALIGN
+        end = min(offset + size, len(data))
 
         return CALBlock(
             offset=offset,
             cas_id=cas_id,
             epk=epk,
-            data=cal_data,
+            data=data[offset:end],
         )
 
     def _extract_folder_entries(self) -> list[FolderEntry]:
@@ -1312,54 +1402,41 @@ class OLSReader:
         """
         entries: list[FolderEntry] = []
         found_names: set[str] = set()
+        data = self.data
+        size = len(data)
 
-        # Find folder section - search for the ffffffff marker pattern
-        # Start from 1/3 into file (folders are typically after CAL block)
-        search_start = len(self.data) // 3
-        marker = b'\xff\xff\xff\xff'
-
-        pos = search_start
+        # Start from 1/3 into file (folders are typically after CAL block).
+        # Searching for marker + zero padding (rather than the bare 0xFFFFFFFF
+        # marker) skips the 0xFF fill areas of embedded flash images.
+        pos = size // 3
         while True:
-            # Find next ffffffff marker
-            pos = self.data.find(marker, pos)
-            if pos < 0 or pos + 20 > len(self.data):
+            pos = data.find(_FOLDER_MARKER, pos)
+            if pos < 0 or pos + 20 > size:
                 break
 
-            # Check structure: [marker] [pad1=0] [idx] [pad2=0] [strlen]
-            pad1 = struct.unpack_from('<I', self.data, pos + 4)[0]
-            idx = struct.unpack_from('<I', self.data, pos + 8)[0]
-            pad2 = struct.unpack_from('<I', self.data, pos + 12)[0]
-            strlen = struct.unpack_from('<I', self.data, pos + 16)[0]
+            idx, pad2, strlen = _U32X3(data, pos + 8)
+            if pad2 == 0 and 5 < strlen < 300 and idx < 2000 and pos + 20 + strlen <= size:
+                text = _decode_cp1252(data[pos + 20:pos + 20 + strlen])
 
-            # Validate structure
-            if pad1 == 0 and pad2 == 0 and 5 < strlen < 300 and idx < 2000:
-                if pos + 20 + strlen <= len(self.data):
-                    try:
-                        s = self.data[pos + 20:pos + 20 + strlen].decode('cp1252', errors='replace')
+                # Must have the NAME: "DESC" format
+                if ': "' in text:
+                    name, desc = text.split(': "', 1)
 
-                        # Must have the NAME: "DESC" format
-                        if ': "' in s:
-                            name, desc = s.split(': "', 1)
-                            desc = desc.rstrip('"')
-
-                            # Validate name: alphanumeric with underscores
-                            clean_name = name.replace('_', '').replace('.', '')
-                            if clean_name.isalnum() and name not in found_names:
-                                found_names.add(name)
-                                entries.append(FolderEntry(
-                                    idx=idx,
-                                    name=name,
-                                    description=desc,
-                                ))
-                                # Skip past this entry
-                                pos = pos + 20 + strlen
-                                continue
-                    except (UnicodeDecodeError, ValueError):
-                        pass
+                    # Validate name: alphanumeric with underscores
+                    if name.replace('_', '').replace('.', '').isalnum() and name not in found_names:
+                        found_names.add(name)
+                        entries.append(FolderEntry(idx=idx, name=name, description=desc.rstrip('"')))
+                        # Skip past this entry
+                        pos += 20 + strlen
+                        continue
 
             pos += 1
 
         return entries
+
+    # -------------------------------------------------------------------
+    # Binary extraction
+    # -------------------------------------------------------------------
 
     def extract_binary(self, version: BinaryVersion) -> bytes:
         """
@@ -1377,68 +1454,91 @@ class OLSReader:
             return b""
 
         # 4-byte WinOLS checksum/marker at the front of every blob
-        MARKER_LEN = 4
-
-        start = version.blob_offset + MARKER_LEN
+        start = version.blob_offset + 4
         end = min(version.blob_offset + version.blob_size, len(self.data))
         if start >= end:
             return b""
         return self.data[start:end]
 
 
-def read_ols(filepath: str | Path) -> OLSFile:
+def read_ols(
+    filepath: str | os.PathLike[str],
+    *,
+    max_decompressed_size: int = DEFAULT_MAX_DECOMPRESSED_SIZE,
+) -> OLSFile:
     """
-    Convenience function to parse an OLS file.
+    Convenience function to parse an OLS or KP file.
 
     Args:
-        filepath: Path to .ols file
+        filepath: Path to .ols/.kp file
+        max_decompressed_size: Limit for decompressed map lists / KP archives
 
     Returns:
         OLSFile with parsed contents
+
+    Raises:
+        OSError: the file cannot be read.
+        OLSFormatError: the file is not a WinOLS file.
+        OLSLimitError: compressed content exceeds ``max_decompressed_size``.
     """
-    return OLSReader(filepath).parse()
+    return OLSReader(filepath, max_decompressed_size=max_decompressed_size).parse()
 
 
-# CLI usage
-if __name__ == "__main__":
-    import sys
+# ---------------------------------------------------------------------------
+# Command line interface
+# ---------------------------------------------------------------------------
 
-    if len(sys.argv) < 2:
-        print("Usage: python ols_reader.py <file.ols|file.kp>")
-        sys.exit(1)
+_UNSAFE_FILENAME_CHARS = re.compile(r'[^A-Za-z0-9._-]+')
 
-    ols = read_ols(sys.argv[1])
 
-    print(f"File: {ols.filename}")
-    print(f"OLS Version: {ols.version}")
+def _safe_filename(name: str, fallback: str = "binary") -> str:
+    """Turn an untrusted name from a file into a harmless file name component."""
+    cleaned = _UNSAFE_FILENAME_CHARS.sub('_', name).strip('._-')
+    return cleaned[:80] or fallback
+
+
+def _json_safe(value: Any) -> Any:
+    """Replace NaN/Infinity (not valid JSON) with None."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _format_summary(ols: OLSFile, limit: Optional[int]) -> list[str]:
+    lines = [
+        f"File: {ols.filename}",
+        f"OLS Version: {ols.version}",
+    ]
     if ols.is_kp_file:
-        print("Type: KP (Kennfeld Pack / Map Pack)")
-        print(f"Data format: {'Big-endian' if ols.big_endian_data else 'Little-endian'}")
+        lines.append("Type: KP (Kennfeld Pack / Map Pack)")
+        lines.append(f"Data format: {'Big-endian' if ols.big_endian_data else 'Little-endian'}")
     else:
-        print("Type: OLS (Project file)")
-    print(f"Vehicle: {ols.make} {ols.model} {ols.engine} ({ols.year})")
+        lines.append("Type: OLS (Project file)")
+    lines.append(f"Vehicle: {ols.make} {ols.model} {ols.engine} ({ols.year})")
     if ols.ecu_type:
         ecu_info = ols.ecu_type
         if ols.ecu_manufacturer:
             ecu_info = f"{ols.ecu_manufacturer} {ecu_info}"
         if ols.sw_number:
             ecu_info += f", SW: {ols.sw_number}"
-        print(f"ECU: {ecu_info}")
-    print(f"Parameters: {len(ols.parameters)}")
+        lines.append(f"ECU: {ecu_info}")
+    lines.append(f"Parameters: {len(ols.parameters)}")
 
     # Count by type
     type_counts: dict[str, int] = {}
     for p in ols.parameters:
         type_counts[p.param_type] = type_counts.get(p.param_type, 0) + 1
     if type_counts:
-        type_str = ", ".join(f"{t}: {c}" for t, c in sorted(type_counts.items()))
-        print(f"  By type: {type_str}")
+        lines.append("  By type: " + ", ".join(f"{t}: {c}" for t, c in sorted(type_counts.items())))
 
     if ols.binary_versions:
-        print(f"\nBinary versions ({len(ols.binary_versions)}):")
+        lines.append(f"\nBinary versions ({len(ols.binary_versions)}):")
         for v in ols.binary_versions:
             if v.version_count > 0:
-                # v597+ format with version index
                 idx_str = f"idx={v.version_index}/{v.version_count}"
             elif v.is_root:
                 idx_str = "ROOT"
@@ -1446,32 +1546,122 @@ if __name__ == "__main__":
                 idx_str = f"parent={v.parent_id}"
             size_str = f" ({v.blob_size / 1024:.0f} KB)" if v.blob_size else ""
             offset_str = f" @{hex(v.blob_offset)}" if v.blob_offset else ""
-            print(f"  {v.name} ({idx_str}){size_str}{offset_str}")
+            epk_str = f" EPK={v.epk}" if v.epk else ""
+            lines.append(f"  {v.name} ({idx_str}){size_str}{offset_str}{epk_str}")
 
     if ols.cal_block:
-        print(f"\nCAL: {ols.cal_block.epk} ({len(ols.cal_block.data) / 1024:.1f} KB)")
+        lines.append(f"\nCAL: {ols.cal_block.epk} ({len(ols.cal_block.data) / 1024:.1f} KB)")
 
     if ols.folders:
-        print(f"\nFolders ({len(ols.folders)}):")
-        # Create lookup for folder names
-        folder_lookup = {f.idx: f for f in ols.folders}
+        lines.append(f"\nFolders ({len(ols.folders)}):")
         for f in ols.folders[:10]:
             desc_str = f": \"{f.description[:40]}\"" if f.description else ""
-            print(f"  [{f.idx:4d}] {f.name}{desc_str}")
+            lines.append(f"  [{f.idx:4d}] {f.name}{desc_str}")
         if len(ols.folders) > 10:
-            print(f"  ... and {len(ols.folders) - 10} more")
+            lines.append(f"  ... and {len(ols.folders) - 10} more")
 
-    # Create folder lookup for parameter display
-    folder_lookup = {f.idx: f.name for f in ols.folders} if ols.folders else {}
-
-    # Show sample parameters with offsets, data type, factor, and folder names
-    print("\nSample parameters:")
-    for p in ols.parameters[:10]:
+    folder_lookup = {f.idx: f.name for f in ols.folders}
+    shown = ols.parameters if limit is None else ols.parameters[:limit]
+    if shown:
+        lines.append("\nParameters:" if limit is None else "\nSample parameters:")
+    for p in shown:
         axis_info = ""
         if p.x_axis:
-            axis_info = f" [xaxis@{hex(p.x_axis.offset)}]"
+            axis_info = f" [xaxis@{hex(p.x_axis.address)}]"
+        if p.y_axis:
+            axis_info += f" [yaxis@{hex(p.y_axis.address)}]"
         folder_name = folder_lookup.get(p.folder_id, "")
         folder_str = f" [{folder_name}]" if folder_name else (f" [folder={p.folder_id}]" if p.folder_id else "")
+        dims = f" {p.cols}x{p.rows}" if p.param_type != "VALUE" else ""
         factor_str = f" *{p.factor}" if p.factor != 1.0 else ""
+        offset_str = f" {p.offset:+}" if p.offset else ""
         unit_str = f" {p.unit}" if p.unit else ""
-        print(f"  {p.param_type:5} {p.data_type:5} {p.name}: @{hex(p.data_offset)}{factor_str}{unit_str}{axis_info}{folder_str}")
+        lines.append(f"  {p.param_type:5} {p.data_type:7} {p.name}:{dims} @{hex(p.data_offset)}"
+                     f"{factor_str}{offset_str}{unit_str}{axis_info}{folder_str}")
+    if limit is not None and len(ols.parameters) > limit:
+        lines.append(f"  ... and {len(ols.parameters) - limit} more (use --all to list everything)")
+    return lines
+
+
+def _extract_binaries(reader: OLSReader, ols: OLSFile, out_dir: Path, force: bool) -> list[Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = _safe_filename(Path(ols.filename).stem, "file")
+    written = []
+    for v in ols.binary_versions:
+        data = reader.extract_binary(v)
+        if not data:
+            continue
+        target = out_dir / f"{stem}.{v.version_index:02d}.{_safe_filename(v.name)}.bin"
+        # "x" refuses to replace existing files (and symlinks) unless --force
+        with open(target, "wb" if force else "xb") as fh:
+            fh.write(data)
+        written.append(target)
+    return written
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """Command line entry point (``pyols`` / ``python -m ols_reader``)."""
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(
+        prog="pyols",
+        description="Inspect WinOLS .ols project files and .kp map packs.",
+    )
+    parser.add_argument("files", nargs="+", type=Path, metavar="FILE", help=".ols or .kp file")
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true", help="print the full parse result as JSON")
+    output.add_argument("--all", action="store_true", help="list every parameter")
+    output.add_argument("--limit", type=int, default=10, metavar="N",
+                        help="number of sample parameters to list (default: 10)")
+    parser.add_argument("--extract", type=Path, metavar="DIR",
+                        help="write every embedded binary version to DIR")
+    parser.add_argument("--force", action="store_true", help="overwrite existing files with --extract")
+    parser.add_argument("--max-decompressed-size", type=int, default=DEFAULT_MAX_DECOMPRESSED_SIZE,
+                        metavar="BYTES", help="limit for decompressed data (default: %(default)s)")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    args = parser.parse_args(argv)
+    if args.limit < 0:
+        parser.error("--limit must not be negative")
+    if args.max_decompressed_size <= 0:
+        parser.error("--max-decompressed-size must be positive")
+
+    status = 0
+    results = []
+    for path in args.files:
+        try:
+            reader = OLSReader(path, max_decompressed_size=args.max_decompressed_size)
+            ols = reader.parse()
+        except (OSError, OLSError) as exc:
+            print(f"pyols: error: {path}: {exc}", file=sys.stderr)
+            status = 1
+            continue
+
+        for warning in ols.warnings:
+            print(f"pyols: warning: {path}: {warning}", file=sys.stderr)
+        if args.json:
+            results.append(_json_safe(ols.to_dict()))
+        else:
+            if len(args.files) > 1:
+                print(f"==> {path} <==")
+            print("\n".join(_format_summary(ols, None if args.all else args.limit)))
+            if len(args.files) > 1:
+                print()
+
+        if args.extract:
+            try:
+                for target in _extract_binaries(reader, ols, args.extract, args.force):
+                    print(f"wrote {target}", file=sys.stderr)
+            except OSError as exc:
+                print(f"pyols: error: {path}: cannot extract binaries: {exc}", file=sys.stderr)
+                status = 1
+
+    if args.json:
+        payload = results[0] if len(args.files) == 1 and results else results
+        print(json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False))
+    return status
+
+
+# CLI usage
+if __name__ == "__main__":
+    sys.exit(main())

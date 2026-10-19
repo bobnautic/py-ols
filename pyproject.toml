@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-ols"
+dynamic = ["version"]
+description = "Fast, dependency-free reader for WinOLS .ols project files and .kp map packs"
+readme = "README.md"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+keywords = ["winols", "ols", "ecu", "tuning", "calibration", "a2l", "parser"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: File Formats",
+]
+
+[project.urls]
+Source = "https://github.com/bobnautic/py-ols"
+
+[project.scripts]
+pyols = "ols_reader:main"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+py-modules = ["ols_reader"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ols_reader.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 130
+target-version = "py39"
+extend-exclude = ["__init__.py"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "B", "C4", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ols_reader", "olsbuild"]
+
+[tool.mypy]
+strict = true
+files = ["ols_reader.py"]
+explicit_package_bases = true
